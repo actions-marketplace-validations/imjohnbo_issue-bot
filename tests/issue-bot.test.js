@@ -1,167 +1,250 @@
+'use strict';
+
+jest.mock('@actions/github');
+
 const issueBot = require('../lib/issue-bot');
-const nock = require('nock');
 const core = require('@actions/core');
-const { getOctokit, context } = require('@actions/github');
-const handlebars = require('handlebars');
+const { getOctokit, mockOctokit } = require('@actions/github');
 
-// jest.mock('handlebars', () => ({
-//     compile: () => {
-//         return () => {}
-//     }
-// }));
-// jest.mock('@actions/core');
+core.info = jest.fn();
+core.debug = jest.fn();
+core.setFailed = jest.fn();
+core.setOutput = jest.fn();
 
-core.debug = jest.fn(console.log);
-core.setFailed = jest.fn(console.log);
+const DEFAULT_ISSUE = { number: 42, id: 100, node_id: 'NEW_NODE_ID' };
+const PREVIOUS_ISSUE = { number: 10, node_id: 'PREV_NODE_ID', assignees: [] };
 
-describe('issueBot', () => {
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockOctokit.rest.issues.create.mockResolvedValue({ data: DEFAULT_ISSUE });
+  mockOctokit.rest.issues.update.mockResolvedValue({ data: DEFAULT_ISSUE });
+  mockOctokit.rest.issues.createComment.mockResolvedValue({});
+  mockOctokit.rest.issues.listForRepo.mockResolvedValue({ data: [] });
+});
 
-    test('checkInputs: pass if only title', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title'
-        })
-        expect(ok).toBe(true);
+// ─── Pure helpers ────────────────────────────────────────────────────────────
+
+describe('needPreviousIssue', () => {
+  test('returns true when any condition is true', () => {
+    expect(issueBot.needPreviousIssue(true, false, false, false)).toBe(true);
+    expect(issueBot.needPreviousIssue(false, true, false, false)).toBe(true);
+    expect(issueBot.needPreviousIssue(false, false, true, false)).toBe(true);
+    expect(issueBot.needPreviousIssue(false, false, false, true)).toBe(true);
+  });
+
+  test('returns false when all conditions are false', () => {
+    expect(issueBot.needPreviousIssue(false, false, false, false)).toBe(false);
+  });
+
+  test('returns false with no arguments', () => {
+    expect(issueBot.needPreviousIssue()).toBe(false);
+  });
+});
+
+describe('issueExists', () => {
+  test('returns true for issue number 0', () => {
+    expect(issueBot.issueExists(0)).toBe(true);
+  });
+
+  test('returns true for positive issue numbers', () => {
+    expect(issueBot.issueExists(1)).toBe(true);
+    expect(issueBot.issueExists(999)).toBe(true);
+  });
+
+  test('returns false for -1 (sentinel: no previous issue)', () => {
+    expect(issueBot.issueExists(-1)).toBe(false);
+  });
+
+  test('returns false for any negative number', () => {
+    expect(issueBot.issueExists(-100)).toBe(false);
+  });
+});
+
+// ─── checkInputs ─────────────────────────────────────────────────────────────
+
+describe('checkInputs', () => {
+  test('passes with only title', () => {
+    expect(issueBot.checkInputs({ title: 'Title' })).toBe(true);
+  });
+
+  test('fails with empty title', () => {
+    expect(issueBot.checkInputs({ title: '' })).toBe(false);
+  });
+
+  test('passes with valid projectType "user"', () => {
+    expect(issueBot.checkInputs({ title: 'T', projectType: 'user' })).toBe(true);
+  });
+
+  test('passes with valid projectType "organization"', () => {
+    expect(issueBot.checkInputs({ title: 'T', projectType: 'organization' })).toBe(true);
+  });
+
+  test('passes with valid projectType "repository"', () => {
+    expect(issueBot.checkInputs({ title: 'T', projectType: 'repository' })).toBe(true);
+  });
+
+  test('fails with unrecognised projectType', () => {
+    expect(issueBot.checkInputs({ title: 'T', projectType: 'nonsense' })).toBe(false);
+  });
+
+  test('passes when pinned and labels provided', () => {
+    expect(issueBot.checkInputs({ title: 'T', pinned: true, labels: 'label1' })).toBe(true);
+  });
+
+  test('fails when pinned but no labels', () => {
+    expect(issueBot.checkInputs({ title: 'T', pinned: true })).toBe(false);
+  });
+
+  test('passes when closePrevious and labels provided', () => {
+    expect(issueBot.checkInputs({ title: 'T', closePrevious: true, labels: 'label1' })).toBe(true);
+  });
+
+  test('fails when closePrevious but no labels', () => {
+    expect(issueBot.checkInputs({ title: 'T', closePrevious: true })).toBe(false);
+  });
+
+  test('passes when linkedComments and labels provided', () => {
+    expect(issueBot.checkInputs({ title: 'T', linkedComments: true, labels: 'label1' })).toBe(true);
+  });
+
+  test('fails when linkedComments but no labels', () => {
+    expect(issueBot.checkInputs({ title: 'T', linkedComments: true })).toBe(false);
+  });
+
+  test('passes when rotateAssignees with labels and assignees', () => {
+    expect(issueBot.checkInputs({
+      title: 'T', rotateAssignees: true, assignees: 'p1, p2', labels: 'l1'
+    })).toBe(true);
+  });
+
+  test('fails when rotateAssignees but no labels', () => {
+    expect(issueBot.checkInputs({
+      title: 'T', rotateAssignees: true, assignees: 'p1'
+    })).toBe(false);
+  });
+
+  test('fails when rotateAssignees but no assignees', () => {
+    expect(issueBot.checkInputs({
+      title: 'T', rotateAssignees: true, labels: 'l1'
+    })).toBe(false);
+  });
+});
+
+// ─── getNextAssignee ──────────────────────────────────────────────────────────
+
+describe('getNextAssignee', () => {
+  test('wraps around a single-element list', () => {
+    expect(issueBot.getNextAssignee(['person1'], 'person1')).toEqual(['person1']);
+  });
+
+  test('advances to the next assignee', () => {
+    expect(issueBot.getNextAssignee(['person1', 'person2'], 'person1')).toEqual(['person2']);
+  });
+
+  test('wraps around from the last assignee', () => {
+    expect(issueBot.getNextAssignee(['p1', 'p2', 'p3'], 'p3')).toEqual(['p1']);
+  });
+
+  test('defaults to first assignee when previous is not in the list', () => {
+    expect(issueBot.getNextAssignee(['p1', 'p2'], 'unknown')).toEqual(['p1']);
+  });
+});
+
+// ─── run ─────────────────────────────────────────────────────────────────────
+
+describe('run', () => {
+  test('creates an issue with minimal inputs', async () => {
+    await issueBot.run({ token: 'tok', title: 'Hello', body: '' });
+
+    expect(getOctokit).toHaveBeenCalledWith('tok');
+    expect(mockOctokit.rest.issues.create).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Hello', owner: 'owner', repo: 'repo' })
+    );
+    expect(core.setOutput).toHaveBeenCalledWith('issue-number', '42');
+  });
+
+  test('does not look up a previous issue when no flags require it', async () => {
+    await issueBot.run({ token: 'tok', title: 'Hello', body: '' });
+
+    expect(mockOctokit.rest.issues.listForRepo).not.toHaveBeenCalled();
+  });
+
+  test('closes previous issue when closePrevious is true', async () => {
+    mockOctokit.rest.issues.listForRepo.mockResolvedValue({ data: [PREVIOUS_ISSUE] });
+
+    await issueBot.run({
+      token: 'tok', title: 'Hello', body: '',
+      labels: ['standup'], closePrevious: true
     });
 
-    test('checkInputs: fail if no title', () => {
-        const ok = issueBot.checkInputs({
-            title: ''
-        })
-        expect(ok).toBe(false);
+    expect(mockOctokit.rest.issues.update).toHaveBeenCalledWith(
+      expect.objectContaining({ issue_number: 10, state: 'closed' })
+    );
+  });
+
+  test('skips closing when there is no previous issue', async () => {
+    await issueBot.run({
+      token: 'tok', title: 'Hello', body: '',
+      labels: ['standup'], closePrevious: true
     });
 
-    test('checkInputs: pass if pinned and labels', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            pinned: true,
-            labels: 'label1, label2'
-        })
-        expect(ok).toBe(true);
+    expect(mockOctokit.rest.issues.update).not.toHaveBeenCalled();
+  });
+
+  test('creates linked comments on both issues when linkedComments is true', async () => {
+    mockOctokit.rest.issues.listForRepo.mockResolvedValue({ data: [PREVIOUS_ISSUE] });
+
+    await issueBot.run({
+      token: 'tok', title: 'Hello', body: '',
+      labels: ['standup'],
+      linkedComments: true,
+      linkedCommentsNewIssueText: 'Previous: #{{ previousIssueNumber }}',
+      linkedCommentsPreviousIssueText: 'Next: #{{ newIssueNumber }}'
     });
 
-    test('checkInputs: fail if pinned and no labels', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            pinned: true
-        })
-        expect(ok).toBe(false);
+    expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledTimes(2);
+    expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+      expect.objectContaining({ issue_number: 42, body: 'Previous: #10' })
+    );
+    expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+      expect.objectContaining({ issue_number: 10, body: 'Next: #42' })
+    );
+  });
+
+  test('adds issue to milestone when milestone input is provided', async () => {
+    await issueBot.run({
+      token: 'tok', title: 'Hello', body: '', milestone: '3'
     });
 
-    test('checkInputs: pass if closePrevious and labels', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            closePrevious: true,
-            labels: 'label1, label2'
-        })
-        expect(ok).toBe(true);
+    expect(mockOctokit.rest.issues.update).toHaveBeenCalledWith(
+      expect.objectContaining({ issue_number: 42, milestone: '3' })
+    );
+  });
+
+  test('rotates assignees based on previous issue assignee', async () => {
+    mockOctokit.rest.issues.listForRepo.mockResolvedValue({
+      data: [{ ...PREVIOUS_ISSUE, assignees: [{ login: 'alice' }] }]
     });
 
-    test('checkInputs: fail if closePrevious and no labels', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            closePrevious: true
-        })
-        expect(ok).toBe(false);
+    await issueBot.run({
+      token: 'tok', title: 'Hello', body: '',
+      labels: ['standup'],
+      assignees: ['alice', 'bob'],
+      rotateAssignees: true
     });
 
-    test('checkInputs: pass if linkedComments and labels', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            linkedComments: true,
-            labels: 'label1, label2'
-        })
-        expect(ok).toBe(true);
-    });
+    expect(mockOctokit.rest.issues.create).toHaveBeenCalledWith(
+      expect.objectContaining({ assignees: ['bob'] })
+    );
+  });
 
-    test('checkInputs: fail if linkedComments and no labels', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            linkedComments: true
-        })
-        expect(ok).toBe(false);
-    });
+  test('calls setFailed on error', async () => {
+    mockOctokit.rest.issues.create.mockRejectedValue(new Error('API failure'));
 
-    test('checkInputs: pass if rotateAssignees, labels, and assignees', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            rotateAssignees: true,
-            assignees: 'person1, person2',
-            labels: 'label1, label2'
-        })
-        expect(ok).toBe(true);
-    });
+    await issueBot.run({ token: 'tok', title: 'Hello', body: '' });
 
-    test('checkInputs: fail if rotateAssignees and no labels', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            rotateAssignees: true,
-            assignees: 'person1, person2'
-        })
-        expect(ok).toBe(false);
-    });
-
-    test('checkInputs: fail if rotateAssignees and no assignees', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            rotateAssignees: true,
-            labels: 'label1, label2'
-        })
-        expect(ok).toBe(false);
-    });
-
-    test('checkInputs: fail if projectType doesnt match user, organization, or repository', () => {
-        const ok = issueBot.checkInputs({
-            title: 'Title',
-            projectType: 'nonsense'
-        })
-        expect(ok).toBe(false);
-    });
-
-    test('getNextAssignee: defaults to empty assignee', () => {
-        const next = issueBot.getNextAssignee([''], '')
-        expect(next).toEqual(['']);
-    });
-
-    test('getNextAssignee: works with one assignee', () => {
-        const next = issueBot.getNextAssignee(['person1'], 'person1')
-        expect(next).toEqual(['person1']);
-    });
-
-    test('getNextAssignee: works with two assignees', () => {
-        const next = issueBot.getNextAssignee(['person1', 'person2'], 'person1')
-        expect(next).toEqual(['person2']);
-    });
-
-    test('getNextAssignee: works "around the corner"', () => {
-        const next = issueBot.getNextAssignee(['person1', 'person2', 'person3'], 'person3')
-        expect(next).toEqual(['person1']);
-    });
-
-    // test('isPinned: something', async () => {
-    //     const pin = nock('https://api.github.com')
-    //         .post('/graphql', () => true)
-    //         .reply(200, { data: {
-    //                 resource: {
-    //                     pinnedIssues: {
-    //                         nodes: [{
-    //                             issue: {
-    //                                 id: 0
-    //                             }
-    //                         }]
-    //                     }
-    //                 }
-    //             } 
-    //         })
-
-    //     const pinned = await issueBot.isPinned(1);
-    //     expect(1).toEqual(1);
-    // });
-
-        // test('run: minimum', async () => {
-    //     await issueBot.run({
-    //         title: 'Title'
-    //     });
-
-    //     expect(getOctokit().issues.create).toHaveBeenCalled();
-    // });
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining('API failure')
+    );
+  });
 });
