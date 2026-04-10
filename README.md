@@ -50,6 +50,20 @@ Simple example:
     title: Hello, world
     body: |-
       :wave: Hi, {{#each assignees}}@{{this}}{{#unless @last}}, {{/unless}}{{/each}}!
+# ...
+```
+
+Example with pinning (note: `pinned` requires `labels`):
+```yml
+# ...
+- name: Create new issue
+  uses: imjohnbo/issue-bot@v3
+  with:
+    assignees: "octocat, monalisa"
+    labels: "standup"
+    title: Hello, world
+    body: |-
+      :wave: Hi, {{#each assignees}}@{{this}}{{#unless @last}}, {{/unless}}{{/each}}!
     pinned: true
 # ...
 ```
